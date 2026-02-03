@@ -1,0 +1,63 @@
+# =========================
+# Node.js
+# =========================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# =========================
+# Environment variables
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# Build / Cache
+# =========================
+dist/
+build/
+.cache/
+.tmp/
+
+# =========================
+# OS / Editor
+# =========================
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+!.vscode/extensions.json
+
+# IntelliJ / WebStorm
+.idea/
+
+# =========================
+# Logs
+# =========================
+logs/
+*.log
+
+# =========================
+# Database / Local data
+# =========================
+*.sqlite
+*.db
+*.dump
+*.sql.bak
+
+# =========================
+# Coverage / Testing
+# =========================
+coverage/
+.nyc_output/
+
+# =========================
+# Misc
+# =========================
+*.swp
+*.swo
+*.bak

@@ -1,0 +1,584 @@
+// index.js
+// ✅ ไม่ใช้ privileged intents
+// ใช้แค่ Guilds + GuildVoiceStates
+//
+// ฟีเจอร์:
+// - Join-to-Create หลายห้อง + แยก Category ต่อห้องได้
+// - สร้างห้อง + ย้ายเจ้าของเข้าไป (เพิ่ม overwrite ให้ตัวบอทกัน category deny)
+// - ลบห้องเมื่อว่าง
+// - Controls: lock/unlock/limit/rename (Buttons + Modals)
+// - แอดมินคุมห้องคนอื่นได้ (admin override)
+// - Log ละเอียด: DB + ส่ง Embed ไปห้อง log
+
+require("dotenv").config();
+
+const {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  ChannelType,
+  PermissionsBitField,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  ActionRowBuilder,
+  EmbedBuilder,
+  MessageFlags
+} = require("discord.js");
+
+const fs = require("fs");
+const path = require("path");
+
+const {
+  initDb,
+  getConfig,
+  isJtcChannel,
+  getJtcCategory,
+  setRoomOwner,
+  getRoomOwner,
+  deleteRoom,
+  insertLogDetailed
+} = require("./db");
+
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
+  partials: [Partials.Channel]
+});
+
+// ===== โหลด commands =====
+client.commands = new Map();
+const commandsPath = path.join(__dirname, "commands");
+for (const file of fs.readdirSync(commandsPath).filter((f) => f.endsWith(".js"))) {
+  const cmd = require(path.join(commandsPath, file));
+  client.commands.set(cmd.data.name, cmd);
+}
+
+// ===== Helper: ส่ง Embed ไปห้อง log =====
+async function sendLogEmbed(guild, cfg, embed) {
+  try {
+    if (!cfg?.log_text_id) return;
+
+    const ch = guild.channels.cache.get(cfg.log_text_id) || (await guild.channels.fetch(cfg.log_text_id).catch(() => null));
+    if (!ch) return;
+    return ch.send({ embeds: [embed] });
+  } catch (err) {
+    console.error("sendLogEmbed error:", err);
+  }
+}
+
+// ===== Helper: Log Embed =====
+function buildLogEmbed({ title, action, channelId, ownerId, actorId, targetUserId, metadata }) {
+  const e = new EmbedBuilder()
+    .setTitle(title)
+    .addFields(
+      { name: "Action", value: `\`${action}\``, inline: true },
+      { name: "Channel", value: channelId ? `<#${channelId}>` : "N/A", inline: true },
+      { name: "Owner", value: ownerId ? `<@${ownerId}>` : "N/A", inline: true }
+    )
+    .setFooter({ text: "Xerl Voice • Detailed Logs" })
+    .setTimestamp();
+
+  if (actorId) e.addFields({ name: "Actor", value: `<@${actorId}>`, inline: true });
+  if (targetUserId) e.addFields({ name: "Target", value: `<@${targetUserId}>`, inline: true });
+
+  if (metadata && Object.keys(metadata).length) {
+    const lines = Object.entries(metadata)
+      .slice(0, 10)
+      .map(([k, v]) => `• **${k}**: ${String(v)}`);
+    e.addFields({ name: "Details", value: lines.join("\n"), inline: false });
+  }
+
+  return e;
+}
+
+// ===== Helper: เช็ค owned room + admin override =====
+async function getUserControllableVoiceChannel(interaction) {
+  const member = interaction.member;
+  const vc = member?.voice?.channel;
+
+  if (!vc) return { ok: false, msg: "❌ คุณต้องอยู่ในห้องเสียงก่อน" };
+
+  const room = await getRoomOwner(vc.id);
+  if (!room) return { ok: false, msg: "❌ ห้องนี้ไม่ใช่ห้องที่ระบบสร้างไว้" };
+
+  const isAdmin = member.permissions.has(PermissionsBitField.Flags.Administrator);
+  const isOwner = room.owner_id === interaction.user.id;
+
+  if (!isOwner && !isAdmin) {
+    return { ok: false, msg: "❌ คุณไม่ใช่เจ้าของห้อง (หรือไม่ใช่แอดมิน)" };
+  }
+
+  return { ok: true, channel: vc, ownerId: room.owner_id, isAdmin, isOwner };
+}
+
+async function isOwnedRoom(channelId) {
+  if (!channelId) return null;
+  return await getRoomOwner(channelId);
+}
+
+// ===== Ready (เปลี่ยนชื่อเป็น clientReady) =====
+client.once("clientReady", async () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
+  try {
+    await initDb();
+    console.log("✅ Database initialized.");
+  } catch (err) {
+    console.error("❌ Database init failed:", err);
+    console.log("⚠️ Running without database (some features may not work).");
+  }
+});
+
+// ===== VoiceStateUpdate =====
+client.on("voiceStateUpdate", async (oldState, newState) => {
+  try {
+    if (oldState.channelId === newState.channelId) return;
+
+    const guild = newState.guild || oldState.guild;
+    if (!guild) return;
+
+    const cfg = await getConfig(guild.id);
+    if (!cfg?.category_id) return; // ต้อง setup ก่อน
+
+    // =========================
+    // 1) JOIN-TO-CREATE (หลายห้อง)
+    // =========================
+    if (newState.channelId) {
+      const isJtc = await isJtcChannel(guild.id, newState.channelId);
+      if (isJtc) {
+        const member = newState.member;
+        if (!member) return;
+
+        // ✅ ใช้ category ตาม JTC ห้องนั้น
+        const jtcCategoryId = await getJtcCategory(guild.id, newState.channelId);
+        const parentCategoryId = jtcCategoryId || cfg.category_id;
+
+        const createdChannel = await guild.channels.create({
+          name: `🎧 ${member.user.username}`,
+          type: ChannelType.GuildVoice,
+          parent: parentCategoryId,
+          permissionOverwrites: [
+            // everyone: เริ่มต้นเข้าได้
+            {
+              id: guild.roles.everyone.id,
+              allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.Connect]
+            },
+            // owner: จัดการห้องได้
+            {
+              id: member.id,
+              allow: [
+                PermissionsBitField.Flags.ViewChannel,
+                PermissionsBitField.Flags.Connect,
+                PermissionsBitField.Flags.ManageChannels,
+                PermissionsBitField.Flags.MoveMembers
+              ]
+            },
+            // ✅ bot: กัน category deny ทับ ทำให้ย้าย/จัดการได้ชัวร์
+            {
+              id: guild.members.me.id,
+              allow: [
+                PermissionsBitField.Flags.ViewChannel,
+                PermissionsBitField.Flags.Connect,
+                PermissionsBitField.Flags.ManageChannels,
+                PermissionsBitField.Flags.MoveMembers
+              ]
+            }
+          ],
+          reason: "Auto create voice channel (per-JTC category)"
+        });
+
+        await setRoomOwner(guild.id, createdChannel.id, member.id);
+
+        await insertLogDetailed(guild.id, "CREATE_ROOM", createdChannel.id, member.id, member.id, null, {
+          created_channel_name: createdChannel.name,
+          joined_jtc_channel_id: newState.channelId,
+          parent_category_id: parentCategoryId
+        });
+
+        await sendLogEmbed(
+          guild,
+          cfg,
+          buildLogEmbed({
+            title: "🎧 สร้างห้องเสียง",
+            action: "CREATE_ROOM",
+            channelId: createdChannel.id,
+            ownerId: member.id,
+            actorId: member.id,
+            targetUserId: null,
+            metadata: {
+              created_channel_name: createdChannel.name,
+              joined_jtc_channel_id: newState.channelId,
+              parent_category_id: parentCategoryId
+            }
+          })
+        );
+
+        // ✅ ย้ายเจ้าของเข้าไป (พร้อม log ถ้าพัง)
+        try {
+          await member.voice.setChannel(createdChannel);
+
+          await insertLogDetailed(guild.id, "MOVE_OWNER_SUCCESS", createdChannel.id, member.id, guild.members.me.id, member.id, {
+            from: newState.channelId,
+            to: createdChannel.id
+          });
+        } catch (e) {
+          console.error("MOVE OWNER FAILED:", e);
+
+          await insertLogDetailed(guild.id, "MOVE_OWNER_FAILED", createdChannel.id, member.id, guild.members.me.id, member.id, {
+            from: newState.channelId,
+            to: createdChannel.id,
+            error: e?.message || String(e)
+          });
+
+          await sendLogEmbed(
+            guild,
+            cfg,
+            buildLogEmbed({
+              title: "⚠️ ย้ายเจ้าของไม่สำเร็จ",
+              action: "MOVE_OWNER_FAILED",
+              channelId: createdChannel.id,
+              ownerId: member.id,
+              actorId: guild.members.me.id,
+              targetUserId: member.id,
+              metadata: { error: e?.message || String(e) }
+            })
+          );
+        }
+
+        return;
+      }
+    }
+
+    // =========================
+    // 2) MEMBER JOIN/LEAVE/MOVE (เฉพาะ owned rooms)
+    // =========================
+    const memberId = newState.member?.id || oldState.member?.id;
+
+    if (!oldState.channelId && newState.channelId && memberId) {
+      const room = await isOwnedRoom(newState.channelId);
+      if (room) {
+        await insertLogDetailed(guild.id, "MEMBER_JOIN", newState.channelId, room.owner_id, memberId, memberId, { event: "join" });
+        await sendLogEmbed(
+          guild,
+          cfg,
+          buildLogEmbed({
+            title: "➡️ สมาชิกเข้าห้อง",
+            action: "MEMBER_JOIN",
+            channelId: newState.channelId,
+            ownerId: room.owner_id,
+            actorId: memberId,
+            targetUserId: memberId,
+            metadata: { event: "join" }
+          })
+        );
+      }
+    }
+
+    if (oldState.channelId && !newState.channelId && memberId) {
+      const room = await isOwnedRoom(oldState.channelId);
+      if (room) {
+        await insertLogDetailed(guild.id, "MEMBER_LEAVE", oldState.channelId, room.owner_id, memberId, memberId, { event: "leave" });
+        await sendLogEmbed(
+          guild,
+          cfg,
+          buildLogEmbed({
+            title: "⬅️ สมาชิกออกห้อง",
+            action: "MEMBER_LEAVE",
+            channelId: oldState.channelId,
+            ownerId: room.owner_id,
+            actorId: memberId,
+            targetUserId: memberId,
+            metadata: { event: "leave" }
+          })
+        );
+      }
+    }
+
+    if (oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId && memberId) {
+      const fromRoom = await isOwnedRoom(oldState.channelId);
+      const toRoom = await isOwnedRoom(newState.channelId);
+
+      if (fromRoom || toRoom) {
+        const ownerId = toRoom?.owner_id || fromRoom?.owner_id || null;
+
+        await insertLogDetailed(guild.id, "MEMBER_MOVE", newState.channelId, ownerId, memberId, memberId, {
+          from: oldState.channelId,
+          to: newState.channelId
+        });
+
+        await sendLogEmbed(
+          guild,
+          cfg,
+          buildLogEmbed({
+            title: "🔀 สมาชิกย้ายห้อง",
+            action: "MEMBER_MOVE",
+            channelId: newState.channelId,
+            ownerId,
+            actorId: memberId,
+            targetUserId: memberId,
+            metadata: { from: oldState.channelId, to: newState.channelId }
+          })
+        );
+      }
+    }
+
+    // =========================
+    // 3) AUTO DELETE ห้อง owner ที่ว่าง
+    // =========================
+    if (oldState.channelId) {
+      const leftChannel = oldState.guild.channels.cache.get(oldState.channelId);
+      if (!leftChannel || leftChannel.type !== ChannelType.GuildVoice) return;
+
+      const ownerRow = await getRoomOwner(leftChannel.id);
+      if (!ownerRow) return;
+
+      if (leftChannel.members.size === 0) {
+        await insertLogDetailed(guild.id, "DELETE_ROOM", leftChannel.id, ownerRow.owner_id, null, null, {
+          reason: "empty_room",
+          deleted_channel_name: leftChannel.name || "unknown"
+        });
+
+        await sendLogEmbed(
+          guild,
+          cfg,
+          buildLogEmbed({
+            title: "🗑️ ลบห้องเสียง (ห้องว่าง)",
+            action: "DELETE_ROOM",
+            channelId: leftChannel.id,
+            ownerId: ownerRow.owner_id,
+            actorId: null,
+            targetUserId: null,
+            metadata: { reason: "empty_room", deleted_channel_name: leftChannel.name || "unknown" }
+          })
+        );
+
+        await leftChannel.delete("Auto delete empty owned voice channel");
+        await deleteRoom(leftChannel.id);
+      }
+    }
+  } catch (err) {
+    console.error("voiceStateUpdate error:", err);
+  }
+});
+
+// ===== Interactions =====
+client.on("interactionCreate", async (interaction) => {
+  try {
+    // Slash Commands
+    if (interaction.isChatInputCommand()) {
+      const cmd = client.commands.get(interaction.commandName);
+      if (!cmd) return;
+      return cmd.execute(interaction);
+    }
+
+    // Buttons
+    if (interaction.isButton()) {
+      const cfg = await getConfig(interaction.guild.id);
+
+      // ✅ กันปุ่ม “หมุน” / timeout
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+      // LOCK
+      if (interaction.customId === "vc_lock") {
+        const res = await getUserControllableVoiceChannel(interaction);
+        if (!res.ok) return interaction.editReply(res.msg);
+
+        const before = res.channel.permissionOverwrites.cache
+          .get(interaction.guild.roles.everyone.id)
+          ?.deny?.has(PermissionsBitField.Flags.Connect)
+          ? "locked"
+          : "unlocked";
+
+        await res.channel.permissionOverwrites.edit(interaction.guild.roles.everyone.id, { Connect: false });
+        const after = "locked";
+
+        await insertLogDetailed(interaction.guild.id, "LOCK", res.channel.id, res.ownerId, interaction.user.id, null, { before, after });
+
+        await sendLogEmbed(
+          interaction.guild,
+          cfg,
+          buildLogEmbed({
+            title: "🔒 ล็อคห้องเสียง",
+            action: "LOCK",
+            channelId: res.channel.id,
+            ownerId: res.ownerId,
+            actorId: interaction.user.id,
+            targetUserId: null,
+            metadata: { before, after }
+          })
+        );
+
+        return interaction.editReply("🔒 ล็อคห้องแล้ว");
+      }
+
+      // UNLOCK
+      if (interaction.customId === "vc_unlock") {
+        const res = await getUserControllableVoiceChannel(interaction);
+        if (!res.ok) return interaction.editReply(res.msg);
+
+        const before = res.channel.permissionOverwrites.cache
+          .get(interaction.guild.roles.everyone.id)
+          ?.deny?.has(PermissionsBitField.Flags.Connect)
+          ? "locked"
+          : "unlocked";
+
+        await res.channel.permissionOverwrites.edit(interaction.guild.roles.everyone.id, { Connect: null });
+        const after = "unlocked";
+
+        await insertLogDetailed(interaction.guild.id, "UNLOCK", res.channel.id, res.ownerId, interaction.user.id, null, { before, after });
+
+        await sendLogEmbed(
+          interaction.guild,
+          cfg,
+          buildLogEmbed({
+            title: "🔓 ปลดล็อคห้องเสียง",
+            action: "UNLOCK",
+            channelId: res.channel.id,
+            ownerId: res.ownerId,
+            actorId: interaction.user.id,
+            targetUserId: null,
+            metadata: { before, after }
+          })
+        );
+
+        return interaction.editReply("🔓 ปลดล็อคห้องแล้ว");
+      }
+
+      // LIMIT modal
+      if (interaction.customId === "vc_limit") {
+        // คอมเมนต์: deferReply ไปแล้ว ต้องลบด้วย editReply แล้วเปิด modal ไม่ได้
+        // วิธีแก้: ลบ deferReply สำหรับปุ่มที่จะเปิด modal โดย “ตอบก่อน” ด้วยการ deleteReply แล้วค่อย showModal
+        await interaction.deleteReply().catch(() => null);
+
+        const res = await getUserControllableVoiceChannel(interaction);
+        if (!res.ok) return interaction.reply({ content: res.msg, flags: MessageFlags.Ephemeral });
+
+        const modal = new ModalBuilder().setCustomId("modal_vc_limit").setTitle("ตั้งค่าจำนวนคนสูงสุด");
+        const input = new TextInputBuilder()
+          .setCustomId("limit_value")
+          .setLabel("ใส่เลข 0-99 (0 = ไม่จำกัด)")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(2);
+
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        return interaction.showModal(modal);
+      }
+
+      // RENAME modal
+      if (interaction.customId === "vc_rename") {
+        await interaction.deleteReply().catch(() => null);
+
+        const res = await getUserControllableVoiceChannel(interaction);
+        if (!res.ok) return interaction.reply({ content: res.msg, flags: MessageFlags.Ephemeral });
+
+        const modal = new ModalBuilder().setCustomId("modal_vc_rename").setTitle("เปลี่ยนชื่อห้องเสียง");
+        const input = new TextInputBuilder()
+          .setCustomId("rename_value")
+          .setLabel("ชื่อใหม่ (1-100 ตัวอักษร)")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(100);
+
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        return interaction.showModal(modal);
+      }
+
+      return interaction.editReply("❌ ปุ่มนี้ยังไม่รองรับ");
+    }
+
+    // Modals
+    if (interaction.isModalSubmit()) {
+      const cfg = await getConfig(interaction.guild.id);
+
+      // SET_LIMIT
+      if (interaction.customId === "modal_vc_limit") {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+        const res = await getUserControllableVoiceChannel(interaction);
+        if (!res.ok) return interaction.editReply(res.msg);
+
+        const raw = interaction.fields.getTextInputValue("limit_value");
+        const limit = Number(raw);
+
+        if (Number.isNaN(limit) || limit < 0 || limit > 99) {
+          return interaction.editReply("❌ ใส่ได้เฉพาะเลข 0 ถึง 99");
+        }
+
+        const before = res.channel.userLimit ?? 0;
+        await res.channel.edit({ userLimit: limit });
+        const after = limit;
+
+        await insertLogDetailed(interaction.guild.id, "SET_LIMIT", res.channel.id, res.ownerId, interaction.user.id, null, { before, after });
+
+        await sendLogEmbed(
+          interaction.guild,
+          cfg,
+          buildLogEmbed({
+            title: "👥 ตั้งค่าจำนวนคนในห้อง",
+            action: "SET_LIMIT",
+            channelId: res.channel.id,
+            ownerId: res.ownerId,
+            actorId: interaction.user.id,
+            targetUserId: null,
+            metadata: { before, after }
+          })
+        );
+
+        return interaction.editReply(`👥 ตั้งค่าจำนวนคนสูงสุดเป็น ${limit} แล้ว`);
+      }
+
+      // RENAME
+      if (interaction.customId === "modal_vc_rename") {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+        const res = await getUserControllableVoiceChannel(interaction);
+        if (!res.ok) return interaction.editReply(res.msg);
+
+        const name = interaction.fields.getTextInputValue("rename_value").trim();
+        if (!name) return interaction.editReply("❌ ชื่อห้องห้ามว่าง");
+
+        const before = res.channel.name;
+        await res.channel.setName(name);
+        const after = name;
+
+        await insertLogDetailed(interaction.guild.id, "RENAME", res.channel.id, res.ownerId, interaction.user.id, null, { before, after });
+
+        await sendLogEmbed(
+          interaction.guild,
+          cfg,
+          buildLogEmbed({
+            title: "✏️ เปลี่ยนชื่อห้องเสียง",
+            action: "RENAME",
+            channelId: res.channel.id,
+            ownerId: res.ownerId,
+            actorId: interaction.user.id,
+            targetUserId: null,
+            metadata: { before, after }
+          })
+        );
+
+        return interaction.editReply(`✏️ เปลี่ยนชื่อห้องเป็น "${name}" แล้ว`);
+      }
+    }
+  } catch (err) {
+    console.error("interactionCreate error:", err);
+    if (interaction.isRepliable()) {
+      try {
+        return interaction.reply({ content: "❌ เกิดข้อผิดพลาดภายในบอท", flags: MessageFlags.Ephemeral });
+      } catch {}
+    }
+  }
+});
+
+// ===== ปิด DB สวย ๆ =====
+process.on("SIGINT", async () => {
+  try {
+    console.log("Shutting down...");
+    const { pool } = require("./db");
+    await pool.end();
+  } finally {
+    process.exit(0);
+  }
+});
+
+client.login(process.env.BOT_TOKEN);
