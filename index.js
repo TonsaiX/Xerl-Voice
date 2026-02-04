@@ -10,11 +10,10 @@
 // - แอดมินคุมห้องคนอื่นได้ (admin override)
 // - Log ละเอียด: DB + ส่ง Embed ไปห้อง log
 //
-// ✅ ปรับตามที่ขอ:
-// - ปลดล็อคแล้ว "กลับไปใช้ permission ตาม Category" (inherit)
-//   => ทำโดย "ลบ overwrite ของ @everyone" ในห้องนั้น
-// - ตอนสร้างห้องใหม่: ไม่ใส่ allow @everyone แล้ว เพื่อให้ permission ตาม Category ตั้งแต่แรก
-//   (แต่ owner+bot ยังเข้าได้แน่นอน)
+// ✅ Fix สำคัญ:
+// - Modal (showModal) ต้องเป็น "การตอบครั้งแรก" ของ interaction เท่านั้น
+// - ดังนั้น ห้าม deferReply() ก่อน showModal()
+// - แก้โดย "แยก flow" ตามปุ่ม: lock/unlock -> deferReply, limit/rename -> showModal ทันที
 
 require("dotenv").config();
 
@@ -162,11 +161,13 @@ client.once("clientReady", async () => {
 // =========================
 client.on("voiceStateUpdate", async (oldState, newState) => {
   try {
+    // คอมเมนต์: ถ้า channel ไม่เปลี่ยน ไม่ต้องทำอะไร
     if (oldState.channelId === newState.channelId) return;
 
     const guild = newState.guild || oldState.guild;
     if (!guild) return;
 
+    // คอมเมนต์: ต้อง /setup ก่อนถึงจะมี config
     const cfg = await getConfig(guild.id);
     if (!cfg?.category_id) return;
 
@@ -180,17 +181,24 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
         const member = newState.member;
         if (!member) return;
 
+        // คอมเมนต์: ใช้ category ตาม JTC ห้องนั้น (ถ้าไม่มี -> ใช้ default category)
         const jtcCategoryId = await getJtcCategory(guild.id, newState.channelId);
         const parentCategoryId = jtcCategoryId || cfg.category_id;
 
-        // ✅ ปรับตามที่ขอ: ไม่ตั้ง allow @everyone แล้ว (ให้ inherit จาก Category)
-        // - owner + bot ยังเข้าได้แน่นอน
+        // คอมเมนต์: สร้างห้องใหม่
         const createdChannel = await guild.channels.create({
           name: `🎧 ${member.user.username}`,
           type: ChannelType.GuildVoice,
           parent: parentCategoryId,
+
+          // ✅ สำคัญ: ใส่ overwrite ให้ bot ด้วยกัน category deny ทับ
           permissionOverwrites: [
-            // owner: จัดการห้องได้ + เข้าได้แน่นอน
+            // everyone: เริ่มต้นเข้าได้
+            {
+              id: guild.roles.everyone.id,
+              allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.Connect]
+            },
+            // owner: จัดการห้องได้
             {
               id: member.id,
               allow: [
@@ -200,7 +208,7 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
                 PermissionsBitField.Flags.MoveMembers
               ]
             },
-            // bot: กัน category deny ทับ + ให้ย้าย/จัดการได้ชัวร์
+            // bot: กันโดน deny จาก category และให้ย้ายคนได้ชัวร์
             {
               id: guild.members.me.id,
               allow: [
@@ -211,16 +219,18 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
               ]
             }
           ],
-          reason: "Auto create voice channel (inherit category perms)"
+
+          reason: "Auto create voice channel (per-JTC category)"
         });
 
+        // คอมเมนต์: บันทึก owner
         await setRoomOwner(guild.id, createdChannel.id, member.id);
 
+        // คอมเมนต์: log สร้างห้อง
         await insertLogDetailed(guild.id, "CREATE_ROOM", createdChannel.id, member.id, member.id, null, {
           created_channel_name: createdChannel.name,
           joined_jtc_channel_id: newState.channelId,
-          parent_category_id: parentCategoryId,
-          everyone_mode: "inherit_category"
+          parent_category_id: parentCategoryId
         });
 
         await sendLogEmbed(
@@ -236,13 +246,12 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
             metadata: {
               created_channel_name: createdChannel.name,
               joined_jtc_channel_id: newState.channelId,
-              parent_category_id: parentCategoryId,
-              everyone_mode: "inherit_category"
+              parent_category_id: parentCategoryId
             }
           })
         );
 
-        // ย้ายเจ้าของเข้าไป
+        // คอมเมนต์: ย้ายเจ้าของเข้าไป (ถ้าพังให้ log)
         try {
           await member.voice.setChannel(createdChannel);
 
@@ -283,7 +292,7 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
           );
         }
 
-        return;
+        return; // ✅ จบ flow JTC
       }
     }
 
@@ -292,6 +301,7 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
     // ---------------------------------
     const memberId = newState.member?.id || oldState.member?.id;
 
+    // Join
     if (!oldState.channelId && newState.channelId && memberId) {
       const room = await isOwnedRoom(newState.channelId);
       if (room) {
@@ -313,6 +323,7 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
       }
     }
 
+    // Leave
     if (oldState.channelId && !newState.channelId && memberId) {
       const room = await isOwnedRoom(oldState.channelId);
       if (room) {
@@ -334,6 +345,7 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
       }
     }
 
+    // Move
     if (oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId && memberId) {
       const fromRoom = await isOwnedRoom(oldState.channelId);
       const toRoom = await isOwnedRoom(newState.channelId);
@@ -402,20 +414,28 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
 });
 
 // =========================
-// 8) Interactions
+// 8) Interactions (Slash / Buttons / Modals)
 // =========================
 client.on("interactionCreate", async (interaction) => {
   try {
-    // Slash
+    // -------------------------
+    // 8.1 Slash Commands
+    // -------------------------
     if (interaction.isChatInputCommand()) {
       const cmd = client.commands.get(interaction.commandName);
       if (!cmd) return;
       return cmd.execute(interaction);
     }
 
-    // Buttons
+    // -------------------------
+    // 8.2 Buttons
+    // -------------------------
     if (interaction.isButton()) {
       const cfg = await getConfig(interaction.guild.id);
+
+      // ✅ สำคัญมาก:
+      // - lock/unlock: deferReply ได้
+      // - limit/rename: ต้อง showModal เป็น response แรก ห้าม defer
 
       // 8.2.1 LOCK
       if (interaction.customId === "vc_lock") {
@@ -424,25 +444,16 @@ client.on("interactionCreate", async (interaction) => {
         const res = await getUserControllableVoiceChannel(interaction);
         if (!res.ok) return interaction.editReply(res.msg);
 
-        const everyoneId = interaction.guild.roles.everyone.id;
-
-        // คอมเมนต์: สถานะก่อนหน้า (ดูจาก deny Connect)
         const before = res.channel.permissionOverwrites.cache
-          .get(everyoneId)
+          .get(interaction.guild.roles.everyone.id)
           ?.deny?.has(PermissionsBitField.Flags.Connect)
           ? "locked"
-          : "unlocked_or_inherit";
+          : "unlocked";
 
-        // ✅ ล็อค: ใส่ overwrite @everyone deny Connect (ไม่ยุ่งกับ ViewChannel)
-        await res.channel.permissionOverwrites.edit(everyoneId, { Connect: false });
-
+        await res.channel.permissionOverwrites.edit(interaction.guild.roles.everyone.id, { Connect: false });
         const after = "locked";
 
-        await insertLogDetailed(interaction.guild.id, "LOCK", res.channel.id, res.ownerId, interaction.user.id, null, {
-          before,
-          after,
-          mode: "deny_connect"
-        });
+        await insertLogDetailed(interaction.guild.id, "LOCK", res.channel.id, res.ownerId, interaction.user.id, null, { before, after });
 
         await sendLogEmbed(
           interaction.guild,
@@ -454,60 +465,57 @@ client.on("interactionCreate", async (interaction) => {
             ownerId: res.ownerId,
             actorId: interaction.user.id,
             targetUserId: null,
-            metadata: { before, after, mode: "deny_connect" }
+            metadata: { before, after }
           })
         );
 
         return interaction.editReply("🔒 ล็อคห้องแล้ว");
       }
 
-      // 8.2.2 UNLOCK (กลับไป inherit category)
+      // 8.2.2 UNLOCK
       if (interaction.customId === "vc_unlock") {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
         const res = await getUserControllableVoiceChannel(interaction);
         if (!res.ok) return interaction.editReply(res.msg);
 
-        const everyoneId = interaction.guild.roles.everyone.id;
+        const before = res.channel.permissionOverwrites.cache
+          .get(interaction.guild.roles.everyone.id)
+          ?.deny?.has(PermissionsBitField.Flags.Connect)
+          ? "locked"
+          : "unlocked";
 
-        const before = res.channel.permissionOverwrites.cache.has(everyoneId)
-          ? "has_everyone_overwrite"
-          : "inherit_category";
+        await res.channel.permissionOverwrites.edit(interaction.guild.roles.everyone.id, { Connect: null });
+        const after = "unlocked";
 
-        // ✅ ปลดล็อคแบบ "เหมือน category" = ลบ overwrite ของ @everyone ทิ้ง
-        await res.channel.permissionOverwrites.delete(everyoneId).catch(() => null);
-
-        const after = "inherit_category";
-
-        await insertLogDetailed(interaction.guild.id, "UNLOCK", res.channel.id, res.ownerId, interaction.user.id, null, {
-          before,
-          after,
-          mode: "inherit_category"
-        });
+        await insertLogDetailed(interaction.guild.id, "UNLOCK", res.channel.id, res.ownerId, interaction.user.id, null, { before, after });
 
         await sendLogEmbed(
           interaction.guild,
           cfg,
           buildLogEmbed({
-            title: "🔓 ปลดล็อคห้องเสียง (inherit category)",
+            title: "🔓 ปลดล็อคห้องเสียง",
             action: "UNLOCK",
             channelId: res.channel.id,
             ownerId: res.ownerId,
             actorId: interaction.user.id,
             targetUserId: null,
-            metadata: { before, after, mode: "inherit_category" }
+            metadata: { before, after }
           })
         );
 
-        return interaction.editReply("🔓 ปลดล็อคแล้ว (กลับไปใช้ permission ตาม Category)");
+        return interaction.editReply("🔓 ปลดล็อคห้องแล้ว");
       }
 
-      // 8.2.3 LIMIT (Modal) - ห้าม defer ก่อน
+      // 8.2.3 LIMIT (Modal) ✅ ห้าม deferReply ก่อน
       if (interaction.customId === "vc_limit") {
         const res = await getUserControllableVoiceChannel(interaction);
-        if (!res.ok) return interaction.reply({ content: res.msg, flags: MessageFlags.Ephemeral });
+        if (!res.ok) {
+          return interaction.reply({ content: res.msg, flags: MessageFlags.Ephemeral });
+        }
 
         const modal = new ModalBuilder().setCustomId("modal_vc_limit").setTitle("ตั้งค่าจำนวนคนสูงสุด");
+
         const input = new TextInputBuilder()
           .setCustomId("limit_value")
           .setLabel("ใส่เลข 0-99 (0 = ไม่จำกัด)")
@@ -516,15 +524,20 @@ client.on("interactionCreate", async (interaction) => {
           .setMaxLength(2);
 
         modal.addComponents(new ActionRowBuilder().addComponents(input));
+
+        // ✅ showModal ต้องเป็น response แรก
         return interaction.showModal(modal);
       }
 
-      // 8.2.4 RENAME (Modal) - ห้าม defer ก่อน
+      // 8.2.4 RENAME (Modal) ✅ ห้าม deferReply ก่อน
       if (interaction.customId === "vc_rename") {
         const res = await getUserControllableVoiceChannel(interaction);
-        if (!res.ok) return interaction.reply({ content: res.msg, flags: MessageFlags.Ephemeral });
+        if (!res.ok) {
+          return interaction.reply({ content: res.msg, flags: MessageFlags.Ephemeral });
+        }
 
         const modal = new ModalBuilder().setCustomId("modal_vc_rename").setTitle("เปลี่ยนชื่อห้องเสียง");
+
         const input = new TextInputBuilder()
           .setCustomId("rename_value")
           .setLabel("ชื่อใหม่ (1-100 ตัวอักษร)")
@@ -533,17 +546,22 @@ client.on("interactionCreate", async (interaction) => {
           .setMaxLength(100);
 
         modal.addComponents(new ActionRowBuilder().addComponents(input));
+
+        // ✅ showModal ต้องเป็น response แรก
         return interaction.showModal(modal);
       }
 
+      // 8.2.5 Unknown button
       return interaction.reply({ content: "❌ ปุ่มนี้ยังไม่รองรับ", flags: MessageFlags.Ephemeral });
     }
 
-    // Modals
+    // -------------------------
+    // 8.3 Modals
+    // -------------------------
     if (interaction.isModalSubmit()) {
       const cfg = await getConfig(interaction.guild.id);
 
-      // SET_LIMIT
+      // 8.3.1 SET_LIMIT
       if (interaction.customId === "modal_vc_limit") {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
@@ -580,7 +598,7 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply(`👥 ตั้งค่าจำนวนคนสูงสุดเป็น ${limit} แล้ว`);
       }
 
-      // RENAME
+      // 8.3.2 RENAME
       if (interaction.customId === "modal_vc_rename") {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
@@ -616,6 +634,7 @@ client.on("interactionCreate", async (interaction) => {
   } catch (err) {
     console.error("interactionCreate error:", err);
 
+    // คอมเมนต์: กันกรณีตอบซ้ำ
     if (interaction?.isRepliable?.()) {
       try {
         if (interaction.deferred || interaction.replied) {
